@@ -67,6 +67,22 @@ inputs:
       remain the gate.
     required: false
     default: ''
+  group:
+    description: >-
+      MATRIX: a stable logical-suite id (e.g. web-unit, frontend, integration,
+      mobile) grouping this job's runs across a monorepo. Shards of one group
+      merge into ONE PR-comment row; distinct groups become distinct rows.
+      Defaults to the runner name — single-suite repos need not set it.
+    required: false
+    default: ''
+  shard-index:
+    description: "MATRIX: this job's shard index (0-based). Default 0."
+    required: false
+    default: '0'
+  shard-total:
+    description: 'MATRIX: total shards for this group. Default 1 (unsharded).'
+    required: false
+    default: '1'
 
 outputs:
   run-id:
@@ -93,6 +109,12 @@ runs:
         TRIGGER: ${{ inputs.trigger }}
         BUDGET_MS: ${{ inputs.budget-ms }}
         CORE_TESTS: ${{ inputs.core-tests }}
+        GROUP: ${{ inputs.group }}
+        SHARD_INDEX: ${{ inputs.shard-index }}
+        SHARD_TOTAL: ${{ inputs.shard-total }}
+        EVENT: ${{ github.event_name }}
+        EVENT_ACTION: ${{ github.event.action }}
+        BRANCH: ${{ github.event.pull_request.base.ref }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -112,6 +134,15 @@ runs:
         fi
         echo "changed files: $(wc -l < /tmp/tr_changed.txt)"
 
+        # 1b. Config-as-code: read .specroster.yml (or .github/testrooster.yml)
+        #     if present. The SERVER parses it and matches Plans to the event;
+        #     the action just ships the raw file + event context. Empty = the
+        #     zero-config default (nothing changes).
+        : > /tmp/tr_config.yml
+        for f in .specroster.yml .github/testrooster.yml; do
+          if [ -f "$f" ]; then cp "$f" /tmp/tr_config.yml; echo "config: $f"; break; fi
+        done
+
         # 2. Prove identity with OIDC (needs `permissions: id-token: write`).
         OIDC=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=specroster" | jq -r .value)
@@ -125,13 +156,20 @@ runs:
           --arg head "$HEAD_SHA" --arg base "$BASE_SHA" \
           --arg src "$SRC_DIR" --arg tests "$TEST_DIR" \
           --arg runner "$RUNNER" --arg trigger "$TRIGGER" \
-          --arg core "$CORE_TESTS" \
+          --arg core "$CORE_TESTS" --arg group "$GROUP" \
+          --arg event "${EVENT:-}" --arg eventAction "${EVENT_ACTION:-}" \
+          --arg branch "${BRANCH:-}" \
           --argjson budget "${BUDGET_MS:-0}" \
           --argjson pr "${PR_NUMBER:-0}" \
+          --argjson shardIndex "${SHARD_INDEX:-0}" \
+          --argjson shardTotal "${SHARD_TOTAL:-1}" \
           --rawfile changed /tmp/tr_changed.txt \
+          --rawfile config /tmp/tr_config.yml \
           '{head_sha: $head, base_sha: $base, pr_number: $pr, src_dir: $src,
             test_dir: $tests, runner: $runner, trigger: $trigger,
-            budget_ms: $budget,
+            budget_ms: $budget, group: $group,
+            shard_index: $shardIndex, shard_total: $shardTotal,
+            config: $config, event: $event, event_action: $eventAction, branch: $branch,
             core_tests: ($core | split("\n") | map(select(length > 0))),
             changed_files: ($changed | split("\n") | map(select(length > 0)))}')
         curl -sSf -X POST "$API_URL/api/v1/runs" \
@@ -175,6 +213,12 @@ runs:
         JUNIT_PATH: ${{ inputs.junit-path }}
       run: |
         set -uo pipefail
+        # GitHub's default composite bash shell runs with -e; `set -uo pipefail`
+        # does NOT clear it. We must swallow the runner's non-zero exit here so
+        # the next step still reports results to SpecRoster (shadow audit, the
+        # miss-rate, and failure attribution all live on FAILING runs). The
+        # job's real pass/fail is re-derived from TR_EXIT in the final step.
+        set +e
         jest_env() {
           export JEST_JUNIT_OUTPUT_DIR="$(dirname "$JUNIT_PATH")"
           export JEST_JUNIT_OUTPUT_NAME="$(basename "$JUNIT_PATH")"
