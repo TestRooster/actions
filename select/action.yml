@@ -121,6 +121,57 @@ runs:
       run: |
         set -euo pipefail
 
+        # --- Fail open ---------------------------------------------------------
+        # SpecRoster is ADVISORY. In shadow mode the full suite runs regardless,
+        # and even under enforcement the safe fallback is "run everything". So an
+        # outage on OUR side must never turn a customer's PR red -- we are not a
+        # gate. On any terminal failure (retries already exhausted) we warn
+        # loudly, run the FULL suite, and skip the upload; the job's pass/fail is
+        # then decided purely by the customer's own tests.
+        #
+        # Downstream contract this must satisfy:
+        #   - TR_SHADOW/TR_RUN_FULL set, or "Run tests" trips `set -u`
+        #   - /tmp/tr_run.json must EXIST (the poster jq's it as a fallback)
+        #   - TR_FAIL_OPEN makes "Report results" skip the upload, since there
+        #     is no run id or token to upload with
+        fail_open() {
+          echo "::warning title=SpecRoster unavailable - running the full test suite::$1. $2"
+          echo '{}' > /tmp/tr_run.json
+          : > /tmp/tr_selected.txt
+          {
+            echo "TR_FAIL_OPEN=true"
+            echo "TR_SHADOW=true"
+            echo "TR_RUN_FULL=true"
+          } >> "$GITHUB_ENV"
+          {
+            echo "run_id="
+            echo "selected_count="
+            echo "suite_count="
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## SpecRoster"
+            echo ""
+            echo "**Unavailable - ran the full test suite.** $1."
+            echo ""
+            echo "$2"
+            echo ""
+            echo "_Your tests were unaffected: SpecRoster is advisory and never gates this job._"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        }
+
+        # A 4xx is almost always the caller's setup; 5xx/000 is ours. Say which,
+        # or a misconfigured repo silently fails open forever and nobody looks.
+        hint_for() {
+          case "$1" in
+            401|403) echo "The SpecRoster GitHub App may not be installed on this repository, or the installation is suspended." ;;
+            400)     echo "The request was rejected - check .specroster.yml. Note the request body (including the change set) is capped at 1 MiB." ;;
+            404)     echo "Not found - check the 'api-url' input." ;;
+            000)     echo "SpecRoster was unreachable (network, DNS or TLS). Check the 'api-url' input." ;;
+            *)       echo "SpecRoster returned an error after retries. This is usually transient." ;;
+          esac
+        }
+
         # 1. The change set (PR trigger only; nightly ranks the whole suite).
         #    Requires the caller to checkout with enough history:
         #    fetch-depth: 0, or deep enough to contain the base.
@@ -144,14 +195,30 @@ runs:
         done
 
         # 2. Prove identity with OIDC (needs `permissions: id-token: write`).
-        OIDC=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=specroster" | jq -r .value)
+        OIDC=$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL:-}&audience=specroster" | jq -r '.value // empty') || OIDC=""
+        if [ -z "$OIDC" ]; then
+          fail_open "could not obtain a GitHub OIDC token" \
+            "Check that the job grants 'permissions: id-token: write'. Fork PRs are never issued an OIDC token by GitHub."
+        fi
+
         # --retry rides out a 429 (server rate limit; curl honors Retry-After)
-        # and transient 5xx — e.g. a wide sharded matrix egressing through one
+        # and transient 5xx -- e.g. a wide sharded matrix egressing through one
         # IP. It does NOT retry 4xx like 401/403, so a bad token fails fast.
-        TR_TOKEN=$(curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/token" \
+        # -f keeps that retry contract; -w captures the code so a terminal
+        # failure can explain ITSELF rather than just exploding.
+        TOKEN_HTTP=$(curl -sS -f --retry 5 --retry-connrefused \
+          -o /tmp/tr_token.json -w '%{http_code}' \
+          -X POST "$API_URL/api/v1/token" \
           -H 'Content-Type: application/json' \
-          -d "$(jq -n --arg t "$OIDC" '{oidc_token: $t}')" | jq -r .token)
+          -d "$(jq -n --arg t "$OIDC" '{oidc_token: $t}')") || true
+        TR_TOKEN=""
+        case "${TOKEN_HTTP:-000}" in
+          2*) TR_TOKEN=$(jq -r '.token // empty' /tmp/tr_token.json 2>/dev/null || echo "") ;;
+        esac
+        if [ -z "$TR_TOKEN" ]; then
+          fail_open "SpecRoster token exchange failed (HTTP ${TOKEN_HTTP:-000})" "$(hint_for "${TOKEN_HTTP:-000}")"
+        fi
         echo "::add-mask::$TR_TOKEN"
 
         # 3. Get the selection manifest.
@@ -175,11 +242,21 @@ runs:
             config: $config, event: $event, event_action: $eventAction, branch: $branch,
             core_tests: ($core | split("\n") | map(select(length > 0))),
             changed_files: ($changed | split("\n") | map(select(length > 0)))}')
-        curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/runs" \
+        RUNS_HTTP=$(curl -sS -f --retry 5 --retry-connrefused \
+          -o /tmp/tr_run.json -w '%{http_code}' \
+          -X POST "$API_URL/api/v1/runs" \
           -H "Authorization: Bearer $TR_TOKEN" -H 'Content-Type: application/json' \
-          -d "$BODY" > /tmp/tr_run.json
+          -d "$BODY") || true
+        case "${RUNS_HTTP:-000}" in
+          2*) ;;
+          *)  fail_open "SpecRoster selection failed (HTTP ${RUNS_HTTP:-000})" "$(hint_for "${RUNS_HTTP:-000}")" ;;
+        esac
 
-        RUN_ID=$(jq -r .run_id /tmp/tr_run.json)
+        RUN_ID=$(jq -r '.run_id // empty' /tmp/tr_run.json 2>/dev/null || echo "")
+        if [ -z "$RUN_ID" ]; then
+          fail_open "SpecRoster returned a malformed selection response" \
+            "The API answered 2xx but without a run_id. This is a SpecRoster bug - please report it."
+        fi
         SHADOW=$(jq -r .shadow /tmp/tr_run.json)
         RUN_FULL=$(jq -r .run_full /tmp/tr_run.json)
         SELECTED_COUNT=$(jq -r .selected_count /tmp/tr_run.json)
@@ -354,6 +431,12 @@ runs:
         OBSERVE=false
         SKIP_UPLOAD=false
         OUTCOME=passed
+        # Step 1 failed open: there is no run id or token to upload with, and
+        # nothing rendered to post. Stay silent on the PR and let the customer's
+        # own test result decide the job. (The warning was already emitted.)
+        if [ "${TR_FAIL_OPEN:-false}" = "true" ]; then
+          SKIP_UPLOAD=true
+        fi
         if [ -n "${JUNIT_INPUT:-}" ]; then
           OBSERVE=true
           JUNIT_PATH="$JUNIT_INPUT"

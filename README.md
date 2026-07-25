@@ -57,17 +57,35 @@ reverse index is built from. This is also the full-suite safety net that
 makes selection safe: a selection miss costs hours of latency, never a
 shipped bug.
 
-## Reliability & rate limits
+## Reliability — SpecRoster can never fail your build
 
-The actions **retry automatically** on HTTP 429 (SpecRoster's per-IP rate
+**`select` fails open.** If SpecRoster is unreachable, errors, or rejects the
+request, the action does **not** fail your job. It prints a warning saying what
+happened, **runs your full test suite**, and skips reporting that run. Your
+build then passes or fails purely on your own tests — exactly as it would if
+you had never installed us.
+
+That's a deliberate design property, not a fallback we hope you never hit.
+Test selection is *advisory*: it only ever narrows what runs, so the safe
+answer to "we can't work out what to select" is always "run everything." We are
+not a gate, and an outage on our side should cost you a few minutes of CI time,
+never a red X on your pull request.
+
+The warning distinguishes the two cases, because they need different responses:
+
+| What you see | Meaning |
+|---|---|
+| `HTTP 401` / `403` | The SpecRoster App isn't installed on this repo, or is suspended — **your setup**, worth fixing |
+| `could not obtain a GitHub OIDC token` | The job is missing `permissions: id-token: write` — **your setup** |
+| `HTTP 000` or `5xx` | SpecRoster was unreachable or erroring — **ours**, usually transient |
+
+Before failing open, calls **retry automatically** on HTTP 429 (our per-IP rate
 limit) and transient 5xx, honoring `Retry-After` — so a wide sharded matrix
-egressing through one IP rides out the limit instead of failing a shard. A
-genuine 4xx (bad token/request) still fails fast, so real problems surface
-immediately.
+egressing through a single runner IP rides out the limit rather than tripping
+over it. You normally never see any of this.
 
-SpecRoster rate-limits its API per client IP; the actions handle it
-transparently, so you normally never see it. Your `.specroster.yml` config is
-capped at **64 KiB** (a real config is a few KB).
+Your `.specroster.yml` config is capped at **64 KiB** (a real config is a few
+KB), and the whole request body — which carries your change set — at **1 MiB**.
 
 ---
 
