@@ -146,7 +146,10 @@ runs:
         # 2. Prove identity with OIDC (needs `permissions: id-token: write`).
         OIDC=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=specroster" | jq -r .value)
-        TR_TOKEN=$(curl -sSf -X POST "$API_URL/api/v1/token" \
+        # --retry rides out a 429 (server rate limit; curl honors Retry-After)
+        # and transient 5xx — e.g. a wide sharded matrix egressing through one
+        # IP. It does NOT retry 4xx like 401/403, so a bad token fails fast.
+        TR_TOKEN=$(curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/token" \
           -H 'Content-Type: application/json' \
           -d "$(jq -n --arg t "$OIDC" '{oidc_token: $t}')" | jq -r .token)
         echo "::add-mask::$TR_TOKEN"
@@ -172,7 +175,7 @@ runs:
             config: $config, event: $event, event_action: $eventAction, branch: $branch,
             core_tests: ($core | split("\n") | map(select(length > 0))),
             changed_files: ($changed | split("\n") | map(select(length > 0)))}')
-        curl -sSf -X POST "$API_URL/api/v1/runs" \
+        curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/runs" \
           -H "Authorization: Bearer $TR_TOKEN" -H 'Content-Type: application/json' \
           -d "$BODY" > /tmp/tr_run.json
 
@@ -373,7 +376,7 @@ runs:
         fi
         if [ "$SKIP_UPLOAD" = "true" ]; then
           : # nothing to upload; the poster falls back to the /runs preview
-        elif curl -sSf -X POST "$API_URL/api/v1/runs/$TR_RUN_ID/results?outcome=$OUTCOME" \
+        elif curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/runs/$TR_RUN_ID/results?outcome=$OUTCOME" \
           -H "Authorization: Bearer $TR_TOKEN" \
           -H 'Content-Type: application/xml' \
           --data-binary "@$JUNIT_PATH" > /tmp/tr_report.json; then

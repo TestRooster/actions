@@ -55,11 +55,13 @@ runs:
         set -euo pipefail
         OIDC=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=specroster" | jq -r .value)
-        TR_TOKEN=$(curl -sSf -X POST "$API_URL/api/v1/token" \
+        # --retry rides out a 429 (rate limit; honors Retry-After) + transient
+        # 5xx; does NOT retry 4xx, so a bad token still fails fast.
+        TR_TOKEN=$(curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/token" \
           -H 'Content-Type: application/json' \
           -d "$(jq -n --arg t "$OIDC" '{oidc_token: $t}')" | jq -r .token)
         echo "::add-mask::$TR_TOKEN"
-        curl -sSf -X POST "$API_URL/api/v1/coverage" \
+        curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/coverage" \
           -H "Authorization: Bearer $TR_TOKEN" \
           -F "head_sha=$GITHUB_SHA" \
           -F "runner=$RUNNER" \

@@ -57,6 +57,18 @@ reverse index is built from. This is also the full-suite safety net that
 makes selection safe: a selection miss costs hours of latency, never a
 shipped bug.
 
+## Reliability & rate limits
+
+The actions **retry automatically** on HTTP 429 (SpecRoster's per-IP rate
+limit) and transient 5xx, honoring `Retry-After` — so a wide sharded matrix
+egressing through one IP rides out the limit instead of failing a shard. A
+genuine 4xx (bad token/request) still fails fast, so real problems surface
+immediately.
+
+SpecRoster rate-limits its API per client IP; the actions handle it
+transparently, so you normally never see it. Your `.specroster.yml` config is
+capped at **64 KiB** (a real config is a few KB).
+
 ---
 
 Source of truth for these actions lives in the main SpecRoster repository;
