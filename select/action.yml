@@ -138,6 +138,10 @@ runs:
           echo "::warning title=SpecRoster unavailable - running the full test suite::$1. $2"
           echo '{}' > /tmp/tr_run.json
           : > /tmp/tr_selected.txt
+          # Self-hosted runners keep /tmp between jobs: a stale report from an
+          # earlier run would make the poster stand down, or repost another
+          # PR's comment. Clear it.
+          rm -f /tmp/tr_report.json /tmp/tr_token.json
           {
             echo "TR_FAIL_OPEN=true"
             echo "TR_SHADOW=true"
@@ -195,11 +199,21 @@ runs:
         done
 
         # 2. Prove identity with OIDC (needs `permissions: id-token: write`).
-        OIDC=$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" \
-          "${ACTIONS_ID_TOKEN_REQUEST_URL:-}&audience=specroster" | jq -r '.value // empty') || OIDC=""
+        #    Distinguish the two causes: an ABSENT request URL is unambiguously
+        #    a permissions/fork problem, while a URL that fails is transient.
+        #    Collapsing them would send a customer to "fix" a workflow that is
+        #    already correct -- on the one message they actually read.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          fail_open "no GitHub OIDC token was offered to this job" \
+            "Grant 'permissions: id-token: write'. Fork PRs are never issued an OIDC token by GitHub."
+        fi
+        OIDC=$(curl -sSf --retry 3 --retry-connrefused \
+          --connect-timeout 10 --max-time 20 --retry-max-time 60 \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=specroster" | jq -r '.value // empty') || OIDC=""
         if [ -z "$OIDC" ]; then
-          fail_open "could not obtain a GitHub OIDC token" \
-            "Check that the job grants 'permissions: id-token: write'. Fork PRs are never issued an OIDC token by GitHub."
+          fail_open "the GitHub OIDC token request failed" \
+            "A transient GitHub Actions error; it usually clears on re-run."
         fi
 
         # --retry rides out a 429 (server rate limit; curl honors Retry-After)
@@ -207,15 +221,28 @@ runs:
         # IP. It does NOT retry 4xx like 401/403, so a bad token fails fast.
         # -f keeps that retry contract; -w captures the code so a terminal
         # failure can explain ITSELF rather than just exploding.
+        # Timeouts matter as much as the retries: without --max-time a hung
+        # server turns "fail open in a few seconds" into 6 attempts x the
+        # server's 2-minute write timeout, i.e. ~25 min of billed runner time
+        # per job before the fallback even fires -- multiplied by every shard.
+        # --retry-max-time is the hard ceiling on the whole retry sequence.
+        #
+        # The response is written to a 0600 file under RUNNER_TEMP and deleted
+        # as soon as the token is extracted: a bearer token in /tmp would
+        # otherwise be readable by every later step, including customer-authored
+        # ones, for the life of the job (and beyond, on self-hosted runners).
+        TOKFILE=$(umask 077; mktemp "${RUNNER_TEMP:-/tmp}/tr_token.XXXXXX")
         TOKEN_HTTP=$(curl -sS -f --retry 5 --retry-connrefused \
-          -o /tmp/tr_token.json -w '%{http_code}' \
+          --connect-timeout 10 --max-time 30 --retry-max-time 120 \
+          -o "$TOKFILE" -w '%{http_code}' \
           -X POST "$API_URL/api/v1/token" \
           -H 'Content-Type: application/json' \
           -d "$(jq -n --arg t "$OIDC" '{oidc_token: $t}')") || true
         TR_TOKEN=""
         case "${TOKEN_HTTP:-000}" in
-          2*) TR_TOKEN=$(jq -r '.token // empty' /tmp/tr_token.json 2>/dev/null || echo "") ;;
+          2*) TR_TOKEN=$(jq -r '.token // empty' "$TOKFILE" 2>/dev/null || echo "") ;;
         esac
+        rm -f "$TOKFILE"
         if [ -z "$TR_TOKEN" ]; then
           fail_open "SpecRoster token exchange failed (HTTP ${TOKEN_HTTP:-000})" "$(hint_for "${TOKEN_HTTP:-000}")"
         fi
@@ -242,7 +269,11 @@ runs:
             config: $config, event: $event, event_action: $eventAction, branch: $branch,
             core_tests: ($core | split("\n") | map(select(length > 0))),
             changed_files: ($changed | split("\n") | map(select(length > 0)))}')
+        # --max-time is generous here (selection genuinely takes seconds on a
+        # large snapshot, and the server's own write timeout is 2m) but bounded,
+        # and --retry-max-time caps the whole sequence at ~5 min.
         RUNS_HTTP=$(curl -sS -f --retry 5 --retry-connrefused \
+          --connect-timeout 10 --max-time 120 --retry-max-time 300 \
           -o /tmp/tr_run.json -w '%{http_code}' \
           -X POST "$API_URL/api/v1/runs" \
           -H "Authorization: Bearer $TR_TOKEN" -H 'Content-Type: application/json' \
@@ -257,10 +288,26 @@ runs:
           fail_open "SpecRoster returned a malformed selection response" \
             "The API answered 2xx but without a run_id. This is a SpecRoster bug - please report it."
         fi
-        SHADOW=$(jq -r .shadow /tmp/tr_run.json)
-        RUN_FULL=$(jq -r .run_full /tmp/tr_run.json)
-        SELECTED_COUNT=$(jq -r .selected_count /tmp/tr_run.json)
-        SUITE_COUNT=$(jq -r .suite_count /tmp/tr_run.json)
+        # These MUST be validated, not just read. If `shadow` and `run_full` come
+        # back absent (or non-boolean), both compare false in step 2, and an empty
+        # `selected` list then takes the "no tests in the blast radius" branch --
+        # which writes a 0-test JUnit and exits GREEN. A malformed response would
+        # silently run NO TESTS AT ALL and pass the build: the single worst
+        # outcome for a test-selection product, and strictly worse than the red X
+        # this whole change set exists to prevent.
+        # NB: do NOT use `.shadow // empty` here. jq's `//` treats **false** as
+        # null-ish, so a perfectly valid `"run_full": false` would come back
+        # empty and every normal run would be misread as malformed. Test on the
+        # type instead.
+        SHADOW=$(jq -r '.shadow   | if type=="boolean" then tostring else empty end' /tmp/tr_run.json 2>/dev/null || echo "")
+        RUN_FULL=$(jq -r '.run_full | if type=="boolean" then tostring else empty end' /tmp/tr_run.json 2>/dev/null || echo "")
+        case "$SHADOW:$RUN_FULL" in
+          true:true|true:false|false:true|false:false) ;;
+          *) fail_open "SpecRoster returned a malformed selection response" \
+               "The API answered 2xx but without usable shadow/run_full fields. This is a SpecRoster bug - please report it." ;;
+        esac
+        SELECTED_COUNT=$(jq -r '.selected_count // 0' /tmp/tr_run.json)
+        SUITE_COUNT=$(jq -r '.suite_count // 0' /tmp/tr_run.json)
         jq -r '.selected[]?' /tmp/tr_run.json > /tmp/tr_selected.txt
 
         {
@@ -272,6 +319,10 @@ runs:
         echo "TR_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
         echo "TR_SHADOW=$SHADOW" >> "$GITHUB_ENV"
         echo "TR_RUN_FULL=$RUN_FULL" >> "$GITHUB_ENV"
+        # GITHUB_ENV persists for the whole job: without this, a second
+        # invocation that SUCCEEDS would inherit TR_FAIL_OPEN=true from an
+        # earlier failed-open one and silently skip its results upload.
+        echo "TR_FAIL_OPEN=false" >> "$GITHUB_ENV"
 
         echo "## SpecRoster" >> "$GITHUB_STEP_SUMMARY"
         if [ "$RUN_FULL" = "true" ]; then
