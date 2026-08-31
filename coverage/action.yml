@@ -17,23 +17,250 @@ inputs:
     required: false
     default: ''
   collect-cmd:
-    description: 'Command that runs the consolidated SpecRoster collector (all runners)'
+    description: >
+      Command that runs the consolidated SpecRoster collector (all runners).
+      Leave at the default and the action downloads and verifies the binary
+      for you. Set it to a path or command of your own to bring your own
+      collector — the action then installs nothing.
     required: false
     default: 'specroster-collect'
+  collector-version:
+    description: >
+      Release tag of the collector to install (e.g. v1.0.0), or "latest" to
+      track the newest release. Pinned by default so a nightly never changes
+      behavior underneath you. Releases come from SpecRoster/Collector,
+      where the collector source lives.
+    required: false
+    default: 'v1.1.0'
   test-project:
     description: 'Test project directory (dotnet only; empty = auto-discover all test projects)'
     required: false
     default: ''
+  src-dir:
+    description: >
+      Repo-relative source directory. Required for pytest and used to plan an
+      incremental collection: without it the server cannot tell source files
+      from anything else, so nothing resolves against the coverage index.
+      Should match the value given to the select action.
+    required: false
+    default: ''
+  test-dir:
+    description: 'Repo-relative test directory (pytest). Should match the select action.'
+    required: false
+    default: 'tests'
+  framework:
+    description: >
+      Target framework to collect against, e.g. net8.0 (dotnet). REQUIRED when
+      the test project targets more than one framework: building all of them is
+      slow, fails outright without every SDK installed, and there is no safe
+      default — collecting against the wrong one profiles code you do not ship.
+      Leave empty for single-target projects.
+    required: false
+    default: ''
+  reseed-after-days:
+    description: >
+      Force a full collection when the last one is older than this many days.
+      Incremental collection is blind to drift the coverage index cannot see —
+      a changed fixture, a configuration value, non-determinism, test ordering
+      — so the index is rebuilt from scratch on a cadence. Server default is 7
+      days and the server caps what it will honour, so this cannot be used to
+      switch reseeding off.
+    required: false
+    default: ''
+  incremental:
+    description: >
+      Collect coverage only for the tests whose covered code changed since the
+      last snapshot, instead of the whole suite. REQUIRES 'fetch-depth: 0' on
+      actions/checkout — the diff is against the last snapshot's commit, which
+      a shallow clone does not contain. Outside Python, per-test
+      coverage costs one process per test, so a full snapshot is the dominant
+      ongoing cost of running SpecRoster. Currently supported for the dotnet
+      runner; other runners collect in full regardless.
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
   steps:
-    - name: Full suite with per-test coverage
+    - name: Install SpecRoster collector
+      shell: bash
+      env:
+        COLLECT_CMD: ${{ inputs.collect-cmd }}
+        COLLECTOR_VERSION: ${{ inputs.collector-version }}
+      run: |
+        set -euo pipefail
+        # Bring-your-own escape hatches, checked before we touch the network.
+        if [ "$COLLECT_CMD" != "specroster-collect" ]; then
+          echo "collect-cmd is overridden ($COLLECT_CMD) — installing nothing"
+          exit 0
+        fi
+        if command -v specroster-collect >/dev/null 2>&1; then
+          echo "specroster-collect is already on PATH — installing nothing"
+          exit 0
+        fi
+
+        case "$(uname -s)" in
+          Linux)                os=linux ;;
+          Darwin)               os=darwin ;;
+          MINGW*|MSYS*|CYGWIN*) os=windows ;;
+          *) echo "::error::unsupported runner OS $(uname -s)"; exit 1 ;;
+        esac
+        case "$(uname -m)" in
+          x86_64|amd64)  arch=amd64 ;;
+          arm64|aarch64) arch=arm64 ;;
+          *) echo "::error::unsupported runner architecture $(uname -m)"; exit 1 ;;
+        esac
+        ext=""; [ "$os" = "windows" ] && ext=".exe"
+        asset="specroster-collect_${os}_${arch}${ext}"
+
+        rel="https://github.com/SpecRoster/Collector/releases"
+        if [ "$COLLECTOR_VERSION" = "latest" ]; then
+          url="$rel/latest/download"
+        else
+          url="$rel/download/$COLLECTOR_VERSION"
+        fi
+
+        dest="${RUNNER_TEMP:-/tmp}/specroster-bin"
+        mkdir -p "$dest"
+        echo "installing $asset from $COLLECTOR_VERSION"
+        curl -fsSL --retry 5 --retry-connrefused -o "$dest/$asset"     "$url/$asset"
+        curl -fsSL --retry 5 --retry-connrefused -o "$dest/SHA256SUMS" "$url/SHA256SUMS"
+
+        # Verify BEFORE the binary is ever executed. Exact field match, so a
+        # shorter asset name can never satisfy itself against a longer line;
+        # the "*" form covers sha256sum's binary-mode output.
+        cd "$dest"
+        awk -v a="$asset" '$2 == a || $2 == "*" a' SHA256SUMS > asset.sums
+        if [ ! -s asset.sums ]; then
+          echo "::error::$asset is not listed in SHA256SUMS for $COLLECTOR_VERSION"; exit 1
+        fi
+        if command -v sha256sum >/dev/null 2>&1; then
+          sha256sum -c asset.sums
+        elif command -v shasum >/dev/null 2>&1; then
+          shasum -a 256 -c asset.sums
+        else
+          echo "::error::no sha256sum/shasum available to verify the download"; exit 1
+        fi
+
+        mv "$asset" "specroster-collect${ext}"
+        chmod +x "specroster-collect${ext}"
+        # GITHUB_PATH applies to LATER steps, which is exactly where the
+        # collector is invoked.
+        echo "$dest" >> "$GITHUB_PATH"
+
+    - name: Plan the collection
+      if: inputs.incremental == 'true'
+      shell: bash
+      env:
+        API_URL: ${{ inputs.api-url }}
+        RUNNER: ${{ inputs.runner }}
+        COLLECT_CMD: ${{ inputs.collect-cmd }}
+        TEST_PROJECT: ${{ inputs.test-project }}
+        FRAMEWORK: ${{ inputs.framework }}
+        SRC_DIR: ${{ inputs.src-dir }}
+        TEST_DIR: ${{ inputs.test-dir }}
+        RESEED_DAYS: ${{ inputs.reseed-after-days }}
+      run: |
+        set -euo pipefail
+        echo "full" > /tmp/tr_mode
+
+        # plan()'s stdout is captured and piped into jq, so anything it prints
+        # becomes jq's input. ::add-mask:: must still reach the step's real
+        # stdout for the runner to see it, hence a dedicated descriptor.
+        exec 3>&1
+
+        # The savings figure has to be somewhere a person actually looks. A
+        # run that quietly falls back to a full collection is GREEN and costs
+        # full price, so a check mark is not evidence that anything was saved.
+        summary() {
+          [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+          printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"
+        }
+
+        # Every failure below falls back to a full collection. Over-collecting
+        # costs time; under-collecting leaves the index wrong, and a wrong
+        # index skips tests.
+        plan() {
+          OIDC=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=specroster" | jq -r .value) || return 1
+          TOKEN=$(curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/token" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$OIDC" '{oidc_token: $t}')" | jq -r .token) || return 1
+          echo "::add-mask::$TOKEN" >&3
+          curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/coverage/plan" \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$1"
+        }
+
+        # Phase 1: learn which commit the last snapshot was taken at.
+        BASE=$(plan "$(jq -nc --arg r "$RUNNER" '{runner: $r}')" | jq -r '.base_sha // ""') || {
+          echo "::warning::could not reach SpecRoster to plan; collecting the full suite"; exit 0; }
+        if [ -z "$BASE" ]; then
+          echo "no prior snapshot for $RUNNER — collecting the full suite"; exit 0
+        fi
+        if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+          # The base is not in this clone (shallow checkout, or force-pushed
+          # away). A diff against a commit we do not have is not a diff.
+          echo "::warning::snapshot base $BASE is not in this checkout — add 'fetch-depth: 0' to actions/checkout, or this job collects the full suite every time"; exit 0
+        fi
+        git diff --name-only "$BASE" HEAD > /tmp/tr_changed.txt || {
+          echo "::warning::could not diff against $BASE; collecting the full suite"; exit 0; }
+        echo "changed since $BASE: $(wc -l < /tmp/tr_changed.txt) file(s)"
+
+        # The inventory: cheap to produce, and required so the server can tell
+        # a test we did not re-collect from one that no longer exists.
+        $COLLECT_CMD -runner "$RUNNER" -project "$TEST_PROJECT" -framework "$FRAMEWORK" \
+          -list-only -collected /tmp/tr_inventory.txt || {
+          echo "::warning::could not list tests; collecting the full suite"; exit 0; }
+
+        # Phase 2: which slice actually has to run.
+        RESP=$(plan "$(jq -nc --arg r "$RUNNER" --argjson rd "${RESEED_DAYS:-0}" \
+          --rawfile inv /tmp/tr_inventory.txt --rawfile ch /tmp/tr_changed.txt \
+          --arg sd "$SRC_DIR" --arg td "$TEST_DIR" \
+          '{runner: $r, reseed_after_days: $rd, src_dir: $sd, test_dir: $td,
+            collected: ($inv | split("\n") | map(select(length > 0))),
+            changed_files: ($ch | split("\n") | map(select(length > 0)))}')") || {
+          echo "::warning::plan request failed; collecting the full suite"; exit 0; }
+
+        if [ "$(jq -r .mode <<<"$RESP")" != "incremental" ]; then
+          REASON=$(jq -r '.reason // .mode' <<<"$RESP")
+          echo "collecting the full suite: $REASON"
+          summary "⚠️ **Full collection** — $REASON" "" \
+            "This run collected the entire suite. That is correct and safe, but it costs full price: if it repeats, incremental collection is not actually saving anything."
+          exit 0
+        fi
+        jq -r '.tests[]?' <<<"$RESP" > /tmp/tr_only.txt
+        echo "incremental" > /tmp/tr_mode
+        printf 'collecting %s of %s tests (%.0f%% saved) — %s stale, %s never profiled, %s removed\n' \
+          "$(wc -l < /tmp/tr_only.txt)" "$(wc -l < /tmp/tr_inventory.txt)" \
+          "$(jq -r '.savings * 100' <<<"$RESP")" \
+          "$(jq -r .stale <<<"$RESP")" "$(jq -r .unprofiled <<<"$RESP")" "$(jq -r .removed <<<"$RESP")"
+        summary "### SpecRoster coverage — incremental" "" \
+          "| | |" "|---|---|" \
+          "| Collected | $(wc -l < /tmp/tr_only.txt | tr -d ' ') of $(wc -l < /tmp/tr_inventory.txt | tr -d ' ') tests |" \
+          "| **Saved** | **$(jq -r '(.savings * 100) | round' <<<"$RESP")%** |" \
+          "| Stale | $(jq -r .stale <<<"$RESP") |" \
+          "| Never profiled | $(jq -r .unprofiled <<<"$RESP") |" \
+          "| Removed | $(jq -r .removed <<<"$RESP") |" \
+          "| Index knows | $(jq -r .profiled <<<"$RESP") of $(jq -r .inventory_size <<<"$RESP") tests |" \
+          "| Base | \`$BASE\` |"
+        # Convergence: a profiled fraction that stops rising means the index
+        # is not catching up with churn.
+        printf 'index knows %s of %s tests\n' "$(jq -r .profiled <<<"$RESP")" "$(jq -r .inventory_size <<<"$RESP")"
+        UNKNOWN=$(jq -r '.unknown_source_files // [] | length' <<<"$RESP")
+        if [ "$UNKNOWN" -gt 0 ]; then
+          # No test has ever executed these, so the index names none to re-run
+          # and whatever would newly cover them stays unprofiled until a
+          # reseed. A rising count is reseed pressure.
+          echo "::notice::$UNKNOWN changed source file(s) no known test covers"
+        fi
+
+    - name: Per-test coverage
       shell: bash
       env:
         RUNNER: ${{ inputs.runner }}
         COLLECT_CMD: ${{ inputs.collect-cmd }}
         TEST_PROJECT: ${{ inputs.test-project }}
+        FRAMEWORK: ${{ inputs.framework }}
         PYTEST_ARGS: ${{ inputs.pytest-args }}
       run: |
         set -euo pipefail
@@ -41,9 +268,18 @@ runs:
         # (which native tool to drive, which flags apply) lives in the
         # collector's tested Go dispatch, not in this shell. Runner-
         # irrelevant flags are ignored by the binary.
+        ONLY=()
+        if [ "$(cat /tmp/tr_mode 2>/dev/null || echo full)" = "incremental" ]; then
+          ONLY=(-only /tmp/tr_only.txt)
+        fi
+        # ${ONLY[@]+...} because an empty array under `set -u` is an unbound
+        # variable before bash 4.4, and macOS runners ship bash 3.2 — that
+        # would break the DEFAULT full-collection path, not the new one.
         $COLLECT_CMD -runner "$RUNNER" \
           -project "$TEST_PROJECT" \
+          -framework "$FRAMEWORK" \
           -pytest-args "$PYTEST_ARGS" \
+          ${ONLY[@]+"${ONLY[@]}"} \
           -o /tmp/tr_coverage.json -collected /tmp/tr_collected.txt
 
     - name: Upload snapshot
@@ -53,18 +289,60 @@ runs:
         RUNNER: ${{ inputs.runner }}
       run: |
         set -euo pipefail
-        OIDC=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=specroster" | jq -r .value)
-        # --retry rides out a 429 (rate limit; honors Retry-After) + transient
-        # 5xx; does NOT retry 4xx, so a bad token still fails fast.
-        TR_TOKEN=$(curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/token" \
-          -H 'Content-Type: application/json' \
-          -d "$(jq -n --arg t "$OIDC" '{oidc_token: $t}')" | jq -r .token)
-        echo "::add-mask::$TR_TOKEN"
-        curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/coverage" \
-          -H "Authorization: Bearer $TR_TOKEN" \
-          -F "head_sha=$GITHUB_SHA" \
-          -F "runner=$RUNNER" \
-          -F "coverage=@/tmp/tr_coverage.json" \
-          -F "collected=@/tmp/tr_collected.txt"
-        echo "coverage snapshot uploaded"
+        exec 3>&1
+
+        # A run token is SINGLE USE — the server marks it consumed on first
+        # presentation — so an upload that is retried needs a new one. Mint
+        # per attempt rather than once.
+        mint() {
+          OIDC=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=specroster" | jq -r .value)
+          # --retry rides out a 429 (rate limit; honors Retry-After) +
+          # transient 5xx; does NOT retry 4xx, so a bad token still fails fast.
+          TOKEN=$(curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/token" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$OIDC" '{oidc_token: $t}')" | jq -r .token)
+          echo "::add-mask::$TOKEN" >&3
+          printf '%s' "$TOKEN"
+        }
+        MODE=$(cat /tmp/tr_mode 2>/dev/null || echo full)
+
+        # Coverage JSON is highly repetitive — the same test IDs repeat on
+        # every line they touch — and compresses about 33x. A large suite's
+        # snapshot does not fit the API body limit uncompressed: a
+        # 3,000-test .NET suite is roughly 91 MB raw and under 3 MB gzipped.
+        # The server detects gzip by content, so this is safe to always do.
+        gzip -9 -c /tmp/tr_coverage.json > /tmp/tr_coverage.json.gz
+        echo "coverage: $(wc -c < /tmp/tr_coverage.json) bytes -> $(wc -c < /tmp/tr_coverage.json.gz) gzipped"
+        EXTRA=()
+        if [ "$MODE" = "incremental" ]; then
+          # `collected` is the FULL inventory; `recollected` names what this
+          # run actually re-ran. The server needs both to tell a test it
+          # carried forward from one that was deleted.
+          EXTRA=(-F "recollected=@/tmp/tr_only.txt" -F "collected=@/tmp/tr_inventory.txt")
+        else
+          EXTRA=(-F "collected=@/tmp/tr_collected.txt")
+        fi
+        upload() {
+          curl -sSf --retry 5 --retry-connrefused -X POST "$API_URL/api/v1/coverage" \
+            -H "Authorization: Bearer $(mint)" \
+            -F "head_sha=$GITHUB_SHA" \
+            -F "runner=$RUNNER" \
+            -F "mode=$MODE" \
+            -F "coverage=@$1" \
+            ${EXTRA[@]+"${EXTRA[@]}"}
+        }
+
+        # Compressed first, uncompressed on rejection. A SpecRoster instance
+        # older than gzip support cannot read a compressed body and answers
+        # 400, and there is no negotiation to ask it first — detection is by
+        # content. Retrying plain keeps a snapshot flowing across the window
+        # where the action is newer than the server it talks to, which during
+        # a rolling deploy is every deploy.
+        if upload /tmp/tr_coverage.json.gz; then
+          echo "coverage snapshot uploaded ($MODE, compressed)"
+        else
+          echo "::warning::compressed upload rejected; retrying uncompressed (the server may predate gzip support)"
+          upload /tmp/tr_coverage.json
+          echo "coverage snapshot uploaded ($MODE, uncompressed)"
+        fi

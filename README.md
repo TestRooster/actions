@@ -7,8 +7,9 @@ OIDC (no API keys to manage), fetch the **Blast Radius** selection manifest,
 run the selected tests, and report results back. All product logic lives
 server-side.
 
-Supported runners: **pytest** (Python) and **gotest** (Go). More coming —
-.NET is next.
+Supported runners: **pytest** (Python), **gotest** (Go), **dotnet** (.NET),
+**jest** (JS/TS), **junit** (JVM/Maven), **rspec** (Ruby), **cargo** (Rust),
+and **phpunit** (PHP).
 
 ## `select` — run only the tests your change can break
 
@@ -33,9 +34,10 @@ In **shadow mode** (the default for new installs) the full suite still runs
 — SpecRoster reports what it *would* have selected and its measured
 would-be miss-rate before anything is ever skipped.
 
-Inputs: `api-url` (required) · `runner` (`pytest`|`gotest`) · `src-dir` ·
-`test-dir` · `trigger` (`pr`|`nightly`) · `budget-ms` · `core-tests` ·
-`pytest-args` · `junit-path`.
+Inputs: `api-url` (required) · `runner` · `src-dir` · `test-dir` ·
+`trigger` (`pr`|`nightly`) · `budget-ms` · `core-tests` · `pytest-args` ·
+`junit-path` · `github-token` · `junit-input` (observe mode) · `group`,
+`shard-index`, `shard-total` (matrix aggregation).
 
 ## `coverage` — the nightly snapshot that powers selection
 
@@ -92,21 +94,26 @@ KB), and the whole request body — which carries your change set — at **1 MiB
 Source of truth for these actions lives in the main SpecRoster repository;
 this repo is a published mirror. Issues → the SpecRoster org.
 
-## Installing the coverage collectors
+## The coverage collector
 
-The non-pytest `coverage` runners need a `specroster-*cover` collector
-binary on the runner's PATH (pytest's collection is plain coverage.py and
-needs nothing extra). Grab the latest from this repo's Releases:
+The `coverage` action needs a `specroster-collect` binary to do the actual
+per-test collection — **and installs it for you.** It matches your runner's
+OS and architecture, verifies the download against the release `SHA256SUMS`
+*before* executing it, and puts it on `PATH`. There is no setup step to add,
+for any runner.
 
-```yaml
-- name: Install SpecRoster collector
-  run: |
-    curl -fsSL -o /usr/local/bin/specroster-dotnetcover \
-      https://github.com/SpecRoster/actions/releases/latest/download/specroster-dotnetcover_linux_amd64
-    chmod +x /usr/local/bin/specroster-dotnetcover
-```
+One binary serves every runner (selected with `-runner`); builds are
+published on this repo's Releases for `linux`/`darwin`/`windows` ×
+`amd64`/`arm64`.
 
-Available: `specroster-gocover` (Go projects can also `go run` it),
-`specroster-dotnetcover`, `specroster-jestcover`, `specroster-jvmcover`,
-`specroster-rbcover`, `specroster-phpcover` — each for
-`linux`/`darwin` × `amd64`/`arm64`, with `SHA256SUMS` alongside.
+Two `coverage` inputs control this, and most repos need neither:
+
+| Input | Default | What it does |
+|---|---|---|
+| `collector-version` | a pinned release tag | Which collector release to install. Pinned so a scheduled job never changes behavior underneath you; `latest` tracks the newest release. |
+| `collect-cmd` | `specroster-collect` | Point at your own path or command and the action installs nothing — for vendored or air-gapped runners. A `specroster-collect` already on `PATH` is likewise left alone. |
+
+> The per-runner `specroster-*cover` binaries have been **removed**;
+> `specroster-collect -runner <name>` replaces all of them. Source for the
+> collector is at [SpecRoster/Collector](https://github.com/SpecRoster/Collector)
+> under Apache-2.0.
